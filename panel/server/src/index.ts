@@ -20,6 +20,7 @@ import {
   setUserInstances,
   listInstances,
   findInstance,
+  setInstanceMemLimits,
   userInstances,
   userCanAccess,
   createInstance,
@@ -47,8 +48,16 @@ import {
   deleteInstanceFile,
   instanceLogs,
   typeInInstance,
+  listOrphanVolumes,
+  removeVolume,
+  listOrphanContainers,
+  removeContainerById,
+  instanceMemoryMB,
+  instanceHttpHealthy,
+  regenInstanceMachineId,
 } from './docker.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
+import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -56,6 +65,11 @@ const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '0.0.0.0';
 const STATIC_DIR = process.env.STATIC_DIR || join(__dirname, '../../web/dist');
 const COOKIE = 'woc_sess';
+// Public hostnames the panel will accept Host headers for, in addition to the
+// always-on loopback + RFC1918 LAN allowlist. Required for HTTPS reverse-proxy
+// deploys (Caddy/nginx/飞牛 内置反代) where the public hostname differs from
+// the LAN IP. See .env.example.
+const ALLOWED_HOSTS = parseAllowedHosts(process.env.PANEL_ALLOWED_HOSTS);
 
 function basicAuth(inst: Instance) {
   return 'Basic ' + Buffer.from(`${inst.kasmUser}:${inst.kasmPassword}`).toString('base64');
@@ -64,6 +78,23 @@ function basicAuth(inst: Instance) {
 initStore();
 
 const app = Fastify({ logger: true, trustProxy: true });
+
+// DNS-rebinding gate: reject requests whose Host header is neither a loopback /
+// RFC1918 LAN address nor in PANEL_ALLOWED_HOSTS. Runs before every route so
+// /api/*, /desktop/* and static-file responses are all covered.
+app.addHook('onRequest', async (req, reply) => {
+  if (!isRequestHostAllowed(req.headers.host, req.headers['x-forwarded-host'], ALLOWED_HOSTS)) {
+    // 把被拒的 Host / X-Forwarded-Host 一起回显，反代调试时可一眼看出"后端实际收到的是什么"
+    // —— 决定是去白名单加这个 host，还是修反代让它透传 Host。不泄露敏感信息。
+    reply.code(400).send({
+      error: 'Host header not allowed',
+      host: parseHost(req.headers.host) || null,
+      forwardedHost: req.headers['x-forwarded-host'] || null,
+      hint: '反代部署请把对外域名加入 PANEL_ALLOWED_HOSTS（.env 逗号分隔，支持 *.example.com），改完用 docker compose up -d 重建容器（不是 restart）使其生效',
+    });
+  }
+});
+
 await app.register(cookie);
 // 文件上传走原始二进制（前端以 application/octet-stream 直传 File）
 app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
@@ -229,12 +260,23 @@ app.get('/api/instances', async (req, reply) => {
 app.post('/api/admin/instances', async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
-  const { name } = (req.body as any) ?? {};
+  const { name, reuseVolume } = (req.body as any) ?? {};
   const allowedUserIds = Array.isArray((req.body as any)?.allowedUserIds) ? (req.body as any).allowedUserIds : [];
   if (!name || String(name).trim().length === 0 || String(name).length > 30) {
     return reply.code(400).send({ error: '实例名称为 1-30 个字符' });
   }
-  const inst = createInstance(String(name), admin.id, allowedUserIds);
+  // 复用卷：必须以 woc-data- 开头，且不能被现存实例占用。后端先校验，避免坏名穿透到 docker run。
+  let reuseVolumeName: string | undefined;
+  if (reuseVolume) {
+    if (typeof reuseVolume !== 'string' || !/^woc-data-[0-9a-zA-Z._-]{1,64}$/.test(reuseVolume)) {
+      return reply.code(400).send({ error: '复用卷名不合法' });
+    }
+    if (listInstances().some((i) => i.volumeName === reuseVolume)) {
+      return reply.code(409).send({ error: '该数据卷已被另一个实例占用' });
+    }
+    reuseVolumeName = reuseVolume;
+  }
+  const inst = createInstance(String(name), admin.id, allowedUserIds, reuseVolumeName);
   try {
     await runInstance(inst);
   } catch (e: any) {
@@ -242,6 +284,132 @@ app.post('/api/admin/instances', async (req, reply) => {
     return reply.code(500).send({ error: '创建容器失败：' + (e?.message || e) });
   }
   return { instance: publicInstance(inst) };
+});
+
+// 列出"未被任何实例引用的 woc-data-* 数据卷"。删除实例时默认保留卷（聊天记录），但 panel 里
+// 看不到这些孤儿卷；本接口让管理员在新建实例时复用旧卷（同微信号扫码可继承聊天记录），
+// 或在不需要时彻底删除。
+app.get('/api/admin/orphan-volumes', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const referenced = new Set(listInstances().map((i) => i.volumeName));
+  try {
+    const volumes = await listOrphanVolumes(referenced);
+    return { volumes };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message || '读取数据卷失败' });
+  }
+});
+
+// 列出"残留的 woc-wx-* 容器"：docker 里存在但 store 没登记。多为 runInstance 启动失败遗留
+// 的 Created 容器，会占着 woc-data-<id> 卷名让删卷报 409。提供给管理员一键清理。
+app.get('/api/admin/orphan-containers', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const known = new Set(listInstances().map((i) => i.containerName));
+  try {
+    const containers = await listOrphanContainers(known);
+    return { containers };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message || '读取容器失败' });
+  }
+});
+
+// 强制删除一个残留容器。仅当它不在 store 的已知容器集中（防误删正在用的实例）。
+app.delete('/api/admin/orphan-containers/:idOrName', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const idOrName = (req.params as any).idOrName;
+  if (!idOrName || typeof idOrName !== 'string') return reply.code(400).send({ error: '参数不合法' });
+  if (listInstances().some((i) => i.containerName === idOrName)) {
+    return reply.code(409).send({ error: '该容器属于现存实例，不能在此删除' });
+  }
+  try {
+    await removeContainerById(idOrName);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message || '删除容器失败' });
+  }
+});
+
+// 显式删除一个未使用的数据卷。被现存实例占用时拒绝（避免误删聊天记录）。
+app.delete('/api/admin/orphan-volumes/:name', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const name = (req.params as any).name;
+  if (!name || typeof name !== 'string' || !name.startsWith('woc-data-')) {
+    return reply.code(400).send({ error: '卷名不合法' });
+  }
+  if (listInstances().some((i) => i.volumeName === name)) {
+    return reply.code(409).send({ error: '该数据卷正被某个实例使用，不能删除' });
+  }
+  try {
+    await removeVolume(name);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message || '删除数据卷失败' });
+  }
+});
+
+// 查/改单实例的内存安全阀（soft / hard）。前端"实例卡片 → 安全"弹窗用。
+// GET 返回 per-instance 当前覆盖值 + 全局默认 + 实时内存（用于弹窗里展示）。
+// PUT 接受 {soft, hard}，每项可为正整数 / null（null = 恢复默认）。
+app.get('/api/admin/instances/:id/mem-limits', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const id = (req.params as any).id;
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  let currentMB = 0;
+  try {
+    if ((await instanceRuntime(inst)) === 'running') currentMB = await instanceMemoryMB(inst);
+  } catch {
+    /* ignore：未运行时为 0 */
+  }
+  return {
+    soft: inst.memSoftLimitMB ?? null,
+    hard: inst.memHardLimitMB ?? null,
+    defaultSoft: DEFAULT_SOFT_MB,
+    defaultHard: DEFAULT_HARD_MB,
+    currentMB,
+    watchdogEnabled: WATCHDOG_ENABLED,
+    intervalSec: WATCHDOG_INTERVAL_SEC,
+  };
+});
+app.put('/api/admin/instances/:id/mem-limits', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const id = (req.params as any).id;
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  const body = (req.body as any) ?? {};
+  // 允许 number / null；其它类型都视为"未提供"（保持原值）
+  const norm = (v: any): number | null | undefined =>
+    v === null ? null : typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : undefined;
+  const s = norm(body.soft);
+  const h = norm(body.hard);
+  // 取最终生效值（写入前校验）
+  const finalSoft = s === undefined ? inst.memSoftLimitMB ?? null : s;
+  const finalHard = h === undefined ? inst.memHardLimitMB ?? null : h;
+  try {
+    const pub = setInstanceMemLimits(
+      id,
+      finalSoft,
+      finalHard,
+    );
+    return { instance: pub };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '阈值不合法' });
+  }
+});
+
+// 重置实例的设备 machine-id（仅管理员）：滚一个全新的唯一设备身份并重启实例。
+// 用于某微信账号被腾讯按"设备风险"标记、登录即被踢时，像"换台新设备"一样恢复。会触发重新扫码登录。
+app.post('/api/admin/instances/:id/regen-machine-id', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const id = (req.params as any).id;
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  try {
+    await regenInstanceMachineId(inst);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '重置设备 ID 失败' });
+  }
 });
 
 // 删除实例（仅管理员）：默认保留数据卷，?purge=1 才永久删聊天记录
@@ -588,6 +756,12 @@ function parseCookies(header?: string): Record<string, string> {
 await app.ready();
 
 app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
+  // DNS-rebinding gate for WebSocket upgrades (Fastify's onRequest hook does
+  // not run on raw upgrades). KasmVNC proxying goes through this path.
+  if (!isRequestHostAllowed(req.headers.host, req.headers['x-forwarded-host'], ALLOWED_HOSTS)) {
+    socket.destroy();
+    return;
+  }
   const parsed = req.url ? parseDesktopUrl(req.url) : null;
   if (!parsed) {
     socket.destroy();
@@ -614,6 +788,110 @@ for (const pub of listInstances()) {
   } catch (e: any) {
     app.log.warn(`[instance] 启动实例 ${pub.id} 失败: ${e?.message || e}`);
   }
+}
+
+// Watchdog：KasmVNC/Xvnc 长跑会泄漏（实测 24h 可达 ~9 GiB），小内存机器会被拖垮。
+// 两档阈值，按"是否有人在用"决定时机：
+//   soft：mem >= soft 且当前无活跃会话 → 主动重启（柔和自愈，不打扰）
+//   hard：mem >= hard → 无视会话强制重启（防止 OOM）
+// 优先级 hard > soft。两档阈值可在面板"管理 → 实例卡片 → 安全"按钮里单实例覆盖；缺省走 env。
+//
+// env 默认（可被 per-instance 覆盖）：
+//   WOC_INSTANCE_MEM_SOFT_MB    soft 阈值；默认 1500
+//   WOC_INSTANCE_MEM_HARD_MB    hard 阈值；默认 2500（也兼容旧名 WOC_INSTANCE_MEM_LIMIT_MB）
+//   WOC_WATCHDOG_INTERVAL_SEC   巡检间隔秒；默认 300（5 分钟），最小 60；0 关闭整个 watchdog
+const DEFAULT_SOFT_MB = Math.max(0, Number(process.env.WOC_INSTANCE_MEM_SOFT_MB ?? 1500));
+const DEFAULT_HARD_MB = Math.max(
+  0,
+  Number(process.env.WOC_INSTANCE_MEM_HARD_MB ?? process.env.WOC_INSTANCE_MEM_LIMIT_MB ?? 2500),
+);
+const WATCHDOG_INTERVAL_SEC = Math.max(60, Number(process.env.WOC_WATCHDOG_INTERVAL_SEC ?? 300));
+const WATCHDOG_ENABLED = WATCHDOG_INTERVAL_SEC > 0 && (DEFAULT_SOFT_MB > 0 || DEFAULT_HARD_MB > 0);
+
+// 单实例生效阈值：per-instance 覆盖优先；为 undefined 则用 env 默认。
+function effectiveLimits(inst: Instance): { soft: number; hard: number } {
+  return {
+    soft: inst.memSoftLimitMB ?? DEFAULT_SOFT_MB,
+    hard: inst.memHardLimitMB ?? DEFAULT_HARD_MB,
+  };
+}
+
+// "当前有人在远程会话" 启发式判定：复用控制权心跳。前端在用户鼠标/键盘/滚轮交互时 2.5s 节流 beat，
+// 故 holder 在 TTL 内即视为"有人在主动操作"。只看屏（不交互）超过 TTL 后会被判为空闲——这是有意的，
+// 软自愈宁愿在"看似空闲"时短暂打扰，也不要拖到 hard 强制重启。
+function hasActiveSession(id: string): boolean {
+  const h = controlHolders.get(id);
+  return !!h && Date.now() - h.at <= CONTROL_TTL;
+}
+
+if (WATCHDOG_ENABLED) {
+  const recovering = new Set<string>(); // 防重入：自愈期间跳过本实例
+  const healthFails = new Map<string, number>(); // id → 连续无响应次数
+  const HEALTH_FAIL_LIMIT = 2; // 连续 N 次无响应才重启，避免误杀刚启动/瞬时抖动
+
+  const recover = async (inst: Instance, reason: string, detail: string) => {
+    recovering.add(inst.id);
+    app.log.warn(`[watchdog] ${inst.containerName} ${detail}`);
+    try {
+      await stopInstance(inst);
+      await runInstance(inst);
+      healthFails.delete(inst.id);
+      app.log.info(`[watchdog] ${inst.containerName} 自愈完成（${reason}）`);
+    } catch (e: any) {
+      app.log.error(`[watchdog] ${inst.containerName} 自愈失败（${reason}）: ${e?.message || e}`);
+    } finally {
+      recovering.delete(inst.id);
+    }
+  };
+
+  const tick = async () => {
+    for (const pub of listInstances()) {
+      const inst = findInstance(pub.id);
+      if (!inst || recovering.has(inst.id)) continue;
+      try {
+        if ((await instanceRuntime(inst)) !== 'running') {
+          healthFails.delete(inst.id);
+          continue;
+        }
+        // 1) 内存阈值自愈（既有）：hard 强制 / soft 仅在无人会话时
+        const mb = await instanceMemoryMB(inst);
+        if (mb > 0) {
+          const { soft, hard } = effectiveLimits(inst);
+          const active = hasActiveSession(inst.id);
+          if (hard > 0 && mb >= hard) {
+            await recover(inst, 'hard', `mem=${mb}MiB ≥ hard=${hard}MiB，强制重启（active=${active}）`);
+            continue;
+          }
+          if (soft > 0 && mb >= soft && !active) {
+            await recover(inst, 'soft', `mem=${mb}MiB ≥ soft=${soft}MiB 且无活跃会话，柔和重启`);
+            continue;
+          }
+          if (soft > 0 && mb >= soft && active) {
+            app.log.info(`[watchdog] ${inst.containerName} mem=${mb}MiB ≥ soft=${soft}MiB 但用户在使用，延后`);
+          }
+        }
+        // 2) 响应性自愈（新）：探测 VNC 是否还能提供页面；连续 N 次无响应 → 重启
+        //    应对"进程没死、显示在线，但 I/O/服务 stall 读不出 VNC 文件、永远卡在正在连接桌面"。
+        const healthy = await instanceHttpHealthy(inst);
+        if (healthy) {
+          healthFails.delete(inst.id);
+          continue;
+        }
+        const fails = (healthFails.get(inst.id) || 0) + 1;
+        healthFails.set(inst.id, fails);
+        app.log.warn(`[watchdog] ${inst.containerName} VNC 无响应（连续 ${fails}/${HEALTH_FAIL_LIMIT}）`);
+        if (fails >= HEALTH_FAIL_LIMIT) {
+          await recover(inst, 'unresponsive', `VNC 连续 ${fails} 次无响应（疑似 I/O/服务 stall），自愈重启`);
+        }
+      } catch (e: any) {
+        app.log.warn(`[watchdog] ${pub.id} 检查异常: ${e?.message || e}`);
+      }
+    }
+  };
+  setInterval(() => void tick(), WATCHDOG_INTERVAL_SEC * 1000).unref();
+  console.log(
+    `[watchdog] 已启用 · soft=${DEFAULT_SOFT_MB} MiB · hard=${DEFAULT_HARD_MB} MiB · 间隔=${WATCHDOG_INTERVAL_SEC}s · 含响应性探测`,
+  );
 }
 
 await app.listen({ port: PORT, host: HOST });

@@ -1,5 +1,6 @@
 import { hostname } from 'node:os';
 import { existsSync, readdirSync } from 'node:fs';
+import http from 'node:http';
 import Docker from 'dockerode';
 import type { Instance } from './store.js';
 
@@ -8,6 +9,49 @@ const PUID = process.env.PUID || '1000';
 const PGID = process.env.PGID || '1000';
 const TZ = process.env.TZ || 'Asia/Shanghai';
 const SHM_SIZE = 1024 * 1024 * 1024; // 1gb
+
+// 默认关闭 KasmVNC 的 GPU 硬件编码（baseimage 检测到 /dev/dri/renderD* 时会给 Xvnc 加 -hw3d）：
+// 在 WSL2 / 虚拟 GPU 环境下该路径会导致 Xvnc 内存持续膨胀（实测反馈 21h 涨到 ~9GB）。
+// 我们已设 LIBGL_ALWAYS_SOFTWARE=1 走软件渲染，hw3d 对微信这类静态界面收益甚微。
+// 真实可用 GPU 想启用硬件编码：面板侧设 WOC_ENABLE_GPU=1。
+const ENABLE_GPU = process.env.WOC_ENABLE_GPU === '1';
+
+// 可选：给每个实例容器设内存上限（GiB），作为 Xvnc 等异常增长时的兜底，避免拖垮宿主。
+// 默认 0 = 不限制（保持原行为）。命中上限时容器内 OOM 杀进程、由 s6 自动重启 VNC。
+const INSTANCE_MEM_GB = Number(process.env.WOC_INSTANCE_MEM_GB) || 0;
+const INSTANCE_MEM = INSTANCE_MEM_GB > 0 ? Math.floor(INSTANCE_MEM_GB * 1024 * 1024 * 1024) : 0;
+
+// 设备伪装：把 /etc/os-release 伪装成 deepin（微信官方支持的发行版，且 Deepin 本就基于 Debian，
+// 与本镜像的 Debian 用户态一致，不会自相矛盾）。默认开启；设 WOC_SPOOF_OS=0 关闭恢复 Debian。
+// 配合 00-woc-identity 钩子里的 machine-id 唯一化 + 真实 hostname，整体让容器更像一台普通 Linux 桌面，
+// 降低被腾讯按"非真实设备/设备农场"判风险的概率。注意：尽力而为，非保证；详见 doc/设备伪装.md。
+const SPOOF_OS = process.env.WOC_SPOOF_OS !== '0';
+
+// 给实例容器派生一个"像个人电脑"的内部 hostname（替代 woc-wx-<hex> 这种容器/服务器特征）。
+// 从 inst.id 稳定派生：同一实例每次重建得到相同名字、不同实例不同。仅作伪装，不参与寻址
+// （反代用容器名 containerName，不用此 hostname）。
+function realisticHostname(id: string): string {
+  const words = ['deepin', 'lenovo', 'thinkpad', 'matebook', 'xiaoxin', 'legion', 'dell', 'asus', 'desktop', 'home'];
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  const w = words[h % words.length];
+  const n = ((h >>> 8) % 900) + 100; // 100-999，避免前导 0
+  return `${w}-pc-${n}`;
+}
+
+// 给实例容器派生一个"像真实有线网卡"的 MAC：常见网卡厂商 OUI 前缀 + 由 id 稳定派生的后三段。
+// 容器默认 MAC 带"本地管理位"（第一字节第 2 位为 1，如 02/26/ee 开头），是"非真实硬件"的明显特征；
+// 这里用全局管理、单播的真实厂商 OUI，更像一台插了网卡的真机。同一实例每次重建得到相同 MAC。
+function realisticMac(id: string): string {
+  // 常见消费级网卡厂商 OUI（全局管理 + 单播，首字节低两位为 0）
+  const ouis = ['001b21', '8c1645', '00e04c', '0021cc', '3c970e', '001422', 'b827eb'];
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 131 + id.charCodeAt(i)) >>> 0;
+  const oui = ouis[h % ouis.length];
+  const hex = (n: number) => (n & 0xff).toString(16).padStart(2, '0');
+  const tail = hex(h >>> 3) + hex(h >>> 11) + hex(h >>> 19);
+  return (oui + tail).match(/.{2}/g)!.join(':');
+}
 
 const docker = new Docker(); // 默认连 /var/run/docker.sock
 
@@ -58,13 +102,18 @@ function videoDevices(): string[] {
 }
 
 function envList(inst: Instance): string[] {
-  return [
+  const env = [
     `PUID=${PUID}`,
     `PGID=${PGID}`,
     `TZ=${TZ}`,
     `CUSTOM_USER=${inst.kasmUser}`,
     `PASSWORD=${inst.kasmPassword}`,
   ];
+  // baseimage 仅检查该变量是否「已设置」（值无关），设上即不再给 Xvnc 加 -hw3d。
+  if (!ENABLE_GPU) env.push('DISABLE_DRI=1');
+  // 透传 os 伪装开关给容器内的 00-woc-identity 钩子（决定是否把 /etc/os-release 改成 deepin）。
+  env.push(`WOC_SPOOF_OS=${SPOOF_OS ? '1' : '0'}`);
+  return env;
 }
 
 // 确保微信镜像在本地存在；缺失则从 GHCR 拉取（首次新建实例时镜像通常还没拉过）。
@@ -98,20 +147,46 @@ export async function runInstance(inst: Instance): Promise<void> {
     ShmSize: SHM_SIZE,
     RestartPolicy: { Name: 'unless-stopped' },
   };
+  if (INSTANCE_MEM > 0) {
+    hostConfig.Memory = INSTANCE_MEM;
+    hostConfig.MemorySwap = INSTANCE_MEM; // 禁止 swap 膨胀：限制即为硬上限
+  }
   if (vids.length) {
     hostConfig.Devices = vids.map((d) => ({ PathOnHost: d, PathInContainer: d, CgroupPermissions: 'rwm' }));
     hostConfig.GroupAdd = ['video']; // 让容器内 abc 用户能访问 /dev/videoN
     console.log(`[docker] 实例 ${inst.id} 挂载摄像头设备: ${vids.join(', ')}`);
   }
-  const container = await docker.createContainer({
+  // 伪装成真实有线网卡 MAC（厂商 OUI），替代容器默认的本地管理位 MAC。
+  const mac = realisticMac(inst.id);
+  const createOpts: Docker.ContainerCreateOptions = {
     name: inst.containerName,
     Image: WECHAT_IMAGE,
-    Hostname: inst.containerName,
+    // 内部 hostname 伪装成"个人电脑"名（不再用 woc-wx-<hex>，那是容器/服务器特征）。
+    // 反代靠容器名 name 寻址，与此 hostname 无关。
+    Hostname: realisticHostname(inst.id),
     Env: envList(inst),
     ExposedPorts: { '3000/tcp': {} },
     HostConfig: hostConfig,
-  });
-  await container.start();
+  };
+  // 自定义网络时，MAC 须写到对应 endpoint 上（新版 docker 弃用顶层 MacAddress）；默认网络则用顶层。
+  if (net) {
+    createOpts.NetworkingConfig = { EndpointsConfig: { [net]: { MacAddress: mac } as any } };
+  } else {
+    (createOpts as any).MacAddress = mac;
+  }
+  const container = await docker.createContainer(createOpts);
+  try {
+    await container.start();
+  } catch (e) {
+    // 启动失败但容器已被创建出来（Created 状态），不清理的话会成为"幽灵容器"——
+    // 它仍占着卷名 woc-data-<id>，让后续删卷报 409。修复 #23 时发现 4 个此类残留。
+    try {
+      await container.remove({ force: true });
+    } catch {
+      /* 容器已被外部移走或正在被清理，忽略 */
+    }
+    throw e;
+  }
 }
 
 // 确保实例容器在运行：缺失则按需创建（不会重建已有卷），停止则启动。
@@ -133,6 +208,26 @@ export async function upgradeInstance(inst: Instance): Promise<void> {
   } catch (e: any) {
     console.warn('[docker] 升级时拉取镜像失败，改用本地镜像重建:', e?.message || e);
   }
+  await runInstance(inst);
+}
+
+// 重置实例的设备 machine-id：删掉持久化的 .woc-machine-id 后重启，由 00-woc-identity 钩子重新生成
+// 一个全新的唯一值（相当于"换一台新设备"）。用于某账号被腾讯风控标记后手动滚新设备身份。
+// 仅对含身份钩子的新镜像有效；旧镜像（升级前）无钩子，先 throw 提示升级，避免做无用功。
+export async function regenInstanceMachineId(inst: Instance): Promise<void> {
+  const hasHook = (
+    await execCapture(inst, [
+      'sh',
+      '-c',
+      'test -f /custom-cont-init.d/00-woc-identity && echo yes || echo no',
+    ])
+  ).trim();
+  if (hasHook !== 'yes') {
+    throw new Error('该实例运行的是旧镜像（无设备身份模块），请先「升级实例」后再重置设备 ID');
+  }
+  // 删除持久化文件；重启时钩子检测到缺失 → 生成新的唯一 machine-id 并写回卷
+  await execCapture(inst, ['sh', '-c', 'rm -f /config/.woc-machine-id']);
+  await stopInstance(inst);
   await runInstance(inst);
 }
 
@@ -159,6 +254,117 @@ export async function removeInstance(inst: Instance, purgeVolume: boolean): Prom
       /* 卷可能不存在 */
     }
   }
+}
+
+// 列出"未被任何容器引用的 woc-data-* 数据卷"。判定改为 docker 真实视角（不再仅看 store），
+// 否则 Created 状态的"幽灵容器"会让卷被误判为孤儿，删除时撞 409（real-world issue：
+// 早期 runInstance 启动失败漏清残留容器，留下 4 个 Created 容器各占一个卷名）。
+export async function listOrphanVolumes(referencedVolumes: Set<string>): Promise<
+  Array<{ name: string; createdAt?: string; sizeBytes?: number }>
+> {
+  // 容器视角：扫所有容器（含已停止 / Created），收集它们挂载的 woc-data-* 卷名
+  const allContainers = await docker.listContainers({ all: true });
+  const containerRefs = new Set<string>();
+  for (const c of allContainers) {
+    for (const m of c.Mounts || []) {
+      if (typeof m.Name === 'string' && m.Name.startsWith('woc-data-')) containerRefs.add(m.Name);
+    }
+  }
+  // 与 store 视角并集：取两者都未引用的卷
+  const referenced = new Set<string>([...referencedVolumes, ...containerRefs]);
+
+  const { Volumes } = (await (docker as any).listVolumes()) || { Volumes: [] };
+  if (!Array.isArray(Volumes)) return [];
+  return Volumes
+    .filter((v: any) => typeof v?.Name === 'string' && v.Name.startsWith('woc-data-') && !referenced.has(v.Name))
+    .map((v: any) => ({
+      name: v.Name,
+      createdAt: v.CreatedAt,
+      // UsageData 仅在 docker engine 启用 -v size=true 时返回，常见情况下没有；缺失就不展示
+      sizeBytes: typeof v?.UsageData?.Size === 'number' && v.UsageData.Size >= 0 ? v.UsageData.Size : undefined,
+    }))
+    .sort((a, b) => (a.createdAt && b.createdAt ? (a.createdAt < b.createdAt ? 1 : -1) : 0));
+}
+
+// 显式删除一个数据卷（管理员清理孤儿卷用）。调用方负责确认它不被现存实例引用。
+export async function removeVolume(name: string): Promise<void> {
+  await docker.getVolume(name).remove({ force: true } as any);
+}
+
+// 列出"残留的 woc-wx-* 容器"：在 docker 里存在但 store 没登记的（多为 runInstance 失败时
+// 留下的 Created 状态容器，或用户手动 docker run 出来的）。给管理员一键清理。
+export async function listOrphanContainers(
+  knownContainerNames: Set<string>,
+): Promise<Array<{ id: string; name: string; status: string; volumeName?: string }>> {
+  const all = await docker.listContainers({ all: true });
+  const out: Array<{ id: string; name: string; status: string; volumeName?: string }> = [];
+  for (const c of all) {
+    const name = (c.Names || []).map((n) => n.replace(/^\//, '')).find((n) => n.startsWith('woc-wx-'));
+    if (!name) continue;
+    if (knownContainerNames.has(name)) continue;
+    const vol = (c.Mounts || []).map((m) => m.Name).find((n) => typeof n === 'string' && n.startsWith('woc-data-'));
+    out.push({ id: c.Id, name, status: c.Status || c.State || '', volumeName: vol });
+  }
+  return out;
+}
+
+// 强制删除一个残留容器（按短/全 id 或容器名都行）。
+export async function removeContainerById(idOrName: string): Promise<void> {
+  await docker.getContainer(idOrName).remove({ force: true });
+}
+
+// 取实例容器的"working set"内存（MB）：等同 docker stats 显示值 = usage - inactive_file。
+// 用于 watchdog 检测 KasmVNC/Xvnc 长跑泄漏（21 小时可涨到 ~9 GiB），无法读取时返回 0（视为"暂未知"，
+// 不触发自愈，避免容器刚启动 stats 不可用就被误杀）。一次性 stats、不订阅 stream。
+export async function instanceMemoryMB(inst: Instance): Promise<number> {
+  try {
+    const c = docker.getContainer(inst.containerName);
+    const s: any = await c.stats({ stream: false } as any);
+    const usage = Number(s?.memory_stats?.usage) || 0;
+    const inactive = Number(
+      s?.memory_stats?.stats?.inactive_file ?? s?.memory_stats?.stats?.total_inactive_file,
+    ) || 0;
+    const bytes = Math.max(0, usage - inactive);
+    return Math.round(bytes / 1024 / 1024);
+  } catch {
+    return 0;
+  }
+}
+
+// 响应性健康探测：实测发现容器跑久了会出现 I/O / 服务 stall —— 进程没死、面板显示"在线"，
+// 但读不出 VNC 客户端静态文件（nginx 报 upstream timed out），浏览器永远卡在"正在连接桌面"。
+// 这里带注入鉴权请求真正会卡的那条路径（/vnc/index.html，经 nginx→kclient 静态serve），
+// 超时即判不健康。无鉴权时 nginx 直接 401（很快），故必须注入鉴权让请求真正打到 kclient 静态层。
+export async function instanceHttpHealthy(inst: Instance, timeoutMs = 8000): Promise<boolean> {
+  const auth = 'Basic ' + Buffer.from(`${inst.kasmUser}:${inst.kasmPassword}`).toString('base64');
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    const req = http.get(
+      {
+        host: inst.containerName,
+        port: 3000,
+        path: '/vnc/index.html',
+        headers: { authorization: auth },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        // 拿到响应头即说明 nginx+kclient 静态serve 活着（健康时为 200）。读掉 body 释放连接。
+        const ok = !!res.statusCode && res.statusCode < 500;
+        res.resume();
+        done(ok);
+      },
+    );
+    req.on('timeout', () => {
+      req.destroy();
+      done(false); // 超时 = stall，判不健康
+    });
+    req.on('error', () => done(false));
+  });
 }
 
 export async function instanceRuntime(inst: Instance): Promise<RuntimeState> {
@@ -317,10 +523,26 @@ export async function downloadFromInstance(inst: Instance, name: string): Promis
     stream.on('error', reject);
   });
   const tar = Buffer.concat(chunks);
-  if (tar.length < 512) return Buffer.alloc(0);
-  const sizeStr = tar.toString('ascii', 124, 135).replace(/\0/g, '').trim();
-  const size = parseInt(sizeStr, 8) || 0;
-  return tar.subarray(512, 512 + size);
+  // 解析 tar，定位真正的普通文件块。Docker(Go archive/tar) 在 mtime 含纳秒精度等情况下会先写一个
+  // PAX 扩展头块（typeflag 'x'），旧代码误把它当文件头、读到的是扩展记录长度 → 返回错误长度的数据
+  // （"大小不对"）。这里跳过 PAX/全局('x'/'g')与 GNU 长名('L'/'K')等扩展头，找到普通文件('0'/NUL)再取内容。
+  let off = 0;
+  while (off + 512 <= tar.length) {
+    const header = tar.subarray(off, off + 512);
+    let allZero = true;
+    for (let i = 0; i < 512; i++) if (header[i] !== 0) { allZero = false; break; }
+    if (allZero) break; // 归档结束（全零块）
+    const sizeStr = header.toString('ascii', 124, 136).replace(/[^0-7]/g, '');
+    const size = sizeStr ? parseInt(sizeStr, 8) : 0;
+    const typeflag = header[156]; // '0'(0x30) 或 NUL(0) = 普通文件
+    const dataStart = off + 512;
+    if (typeflag === 0x30 || typeflag === 0) {
+      return tar.subarray(dataStart, dataStart + size);
+    }
+    // 扩展头/目录等：跳过其数据块（向上对齐 512）后继续
+    off = dataStart + size + ((512 - (size % 512)) % 512);
+  }
+  return Buffer.alloc(0);
 }
 
 // 拉取实例容器日志（末尾 N 行），供前端"查看/导出日志"排错。

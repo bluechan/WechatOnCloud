@@ -12,6 +12,25 @@ const MenuIcon = (
   </svg>
 );
 
+// 折叠菜单的展开箭头
+const CaretIcon = (
+  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M6 9l6 6 6-6" />
+  </svg>
+);
+
+// 友好空状态：圆形图标 + 标题 + 说明 + 可选引导按钮（沿用首页 .empty-state 样式）
+function EmptyState({ icon, title, sub, action }: { icon: string; title: string; sub?: string; action?: JSX.Element }) {
+  return (
+    <div className="empty-state">
+      <div className="empty-blob">{icon}</div>
+      <div className="empty-title">{title}</div>
+      {sub && <div className="empty-sub">{sub}</div>}
+      {action && <div className="empty-action">{action}</div>}
+    </div>
+  );
+}
+
 export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: () => void; onChangePassword: () => void }) {
   const nav = useNavigate();
   const { user } = useAuth();
@@ -27,7 +46,12 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
   const [resetTarget, setResetTarget] = useState<PanelUser | null>(null); // 重置密码弹窗
   const [deleteInst, setDeleteInst] = useState<InstanceWithStatus | null>(null); // 删除实例弹窗
   const [renameInst, setRenameInst] = useState<InstanceWithStatus | null>(null); // 重命名实例弹窗
+  const [securityInst, setSecurityInst] = useState<InstanceWithStatus | null>(null); // 安全（内存阈值）弹窗
   const [acting, setActing] = useState<Record<string, string>>({}); // 实例 id → 进行中的动作文案（启动中/升级中…）
+  // 未使用的旧数据卷（来自之前删实例时未勾选"彻底清除"）：允许复用以继承聊天记录，或显式删除。
+  const [orphanVols, setOrphanVols] = useState<{ name: string; createdAt?: string; sizeBytes?: number }[]>([]);
+  // 残留 woc-wx-* 容器（runInstance 启动失败遗留的 Created 容器等）：占着卷名让删卷报 409。
+  const [orphanConts, setOrphanConts] = useState<{ id: string; name: string; status: string; volumeName?: string }[]>([]);
   const setAct = (id: string, label: string | null) =>
     setActing((a) => {
       const n = { ...a };
@@ -47,6 +71,60 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
       setInstances(instances);
     } catch (e: any) {
       setErr(e.message);
+    }
+    // 孤儿卷 / 残留容器独立 catch：docker 接口失败不应阻塞用户/实例视图
+    try {
+      const { volumes } = await api.listOrphanVolumes();
+      setOrphanVols(volumes);
+    } catch {
+      /* ignore */
+    }
+    try {
+      const { containers } = await api.listOrphanContainers();
+      setOrphanConts(containers);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const removeOrphanCont = async (c: { id: string; name: string }) => {
+    const ok = await confirm({
+      title: `删除残留容器「${c.name}」？`,
+      body: '此容器不属于任何登记实例（多为创建失败遗留）。删除不会动数据卷，删后才能继续清理同名旧数据卷。',
+      danger: true,
+      confirmText: '删除容器',
+    });
+    if (!ok) return;
+    try {
+      await api.deleteOrphanContainer(c.id);
+      toast('已删除残留容器，可继续清理数据卷', 'ok');
+      setOrphanConts((cs) => cs.filter((x) => x.id !== c.id));
+      // 容器走了之后，原本被它占着的卷可能从"被引用"翻成"孤儿"，刷新一次
+      try {
+        const { volumes } = await api.listOrphanVolumes();
+        setOrphanVols(volumes);
+      } catch {
+        /* ignore */
+      }
+    } catch (e: any) {
+      toast(e.message || '删除失败', 'error');
+    }
+  };
+
+  const removeOrphanVol = async (name: string) => {
+    const ok = await confirm({
+      title: `彻底删除数据卷「${name}」？`,
+      body: '该卷里保存的微信本地数据（聊天记录缓存等）将永久消失，无法恢复。',
+      danger: true,
+      confirmText: '彻底删除',
+    });
+    if (!ok) return;
+    try {
+      await api.deleteOrphanVolume(name);
+      toast('已删除数据卷', 'ok');
+      setOrphanVols((vs) => vs.filter((v) => v.name !== name));
+    } catch (e: any) {
+      toast(e.message || '删除失败', 'error');
     }
   };
 
@@ -151,9 +229,16 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
               </button>
             </div>
             {instances.length === 0 ? (
-              <div className="list">
-                <div className="muted small" style={{ padding: '14px 16px' }}>暂无实例</div>
-              </div>
+              <EmptyState
+                icon="🖥️"
+                title="还没有微信实例"
+                sub="新建一个实例，进入后扫码登录即可在浏览器里用微信"
+                action={
+                  <button className="btn btn-primary" onClick={() => setCreatingInst(true)}>
+                    ＋ 新建微信实例
+                  </button>
+                }
+              />
             ) : (
               <div className="inst-grid">
                 {instances.map((inst) => (
@@ -171,6 +256,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                     onRename={() => setRenameInst(inst)}
                     onAssign={() => setAssignInst(inst)}
                     onDelete={() => setDeleteInst(inst)}
+                    onSecurity={() => setSecurityInst(inst)}
                   />
                 ))}
               </div>
@@ -183,9 +269,16 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
               </button>
             </div>
             {subs.length === 0 ? (
-              <div className="list">
-                <div className="muted small" style={{ padding: '14px 16px' }}>暂无子账号</div>
-              </div>
+              <EmptyState
+                icon="👥"
+                title="还没有子账号"
+                sub="子账号是登录这套面板的身份，可按账号分配能访问哪些实例"
+                action={
+                  <button className="btn btn-primary" onClick={() => setCreatingUser(true)}>
+                    ＋ 新建子账号
+                  </button>
+                }
+              />
             ) : (
               <div className="inst-grid">
                 {subs.map((u) => (
@@ -221,6 +314,63 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                   </div>
                 ))}
               </div>
+            )}
+            {orphanConts.length > 0 && (
+              <>
+                <div className="section-row" style={{ marginTop: 22 }}>
+                  <span className="section-title">残留容器</span>
+                  <span className="muted small">不属于任何登记实例（多为创建失败遗留）；它们占着数据卷名，需先清理它们才能删除同名数据卷。</span>
+                </div>
+                <div className="inst-grid">
+                  {orphanConts.map((c) => (
+                    <div key={c.id} className="inst-card">
+                      <div className="inst-head">
+                        <span className="inst-name" style={{ fontFamily: 'monospace', fontSize: 13 }}>{c.name}</span>
+                        <span className="tag tag-off">{c.status || 'unknown'}</span>
+                      </div>
+                      {c.volumeName && (
+                        <div className="inst-sub" style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                          占用卷：{c.volumeName}
+                        </div>
+                      )}
+                      <div className="inst-admin-links">
+                        <button className="btn-text danger" onClick={() => removeOrphanCont(c)}>
+                          删除容器
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            {orphanVols.length > 0 && (
+              <>
+                <div className="section-row" style={{ marginTop: 22 }}>
+                  <span className="section-title">未使用的数据卷</span>
+                  <span className="muted small">删除实例时未勾选「彻底清除」会保留下来；可在新建实例时复用以继承聊天记录。</span>
+                </div>
+                <div className="inst-grid">
+                  {orphanVols.map((v) => (
+                    <div key={v.name} className="inst-card">
+                      <div className="inst-head">
+                        <span className="inst-name" style={{ fontFamily: 'monospace', fontSize: 13 }}>{v.name}</span>
+                      </div>
+                      <div className="inst-sub">
+                        {v.createdAt ? `创建于 ${v.createdAt.slice(0, 10)}` : '创建时间未知'}
+                        {typeof v.sizeBytes === 'number' ? `　·　${(v.sizeBytes / 1024 / 1024).toFixed(1)} MB` : ''}
+                      </div>
+                      <div className="inst-admin-links">
+                        <button className="btn-text" onClick={() => setCreatingInst(true)} title="去「新建实例」对话框，在「数据卷」下拉里选择复用此卷">
+                          复用为新实例
+                        </button>
+                        <button className="btn-text danger" onClick={() => removeOrphanVol(v.name)}>
+                          彻底删除
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
             )}
           </>
         )}
@@ -319,6 +469,16 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
           }}
         />
       )}
+      {securityInst && (
+        <InstanceSecurity
+          inst={securityInst}
+          onClose={() => setSecurityInst(null)}
+          onDone={() => {
+            toast('已保存安全阈值', 'ok');
+            load();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -402,6 +562,199 @@ function ResetPassword({ user, onClose, onDone }: { user: PanelUser; onClose: ()
   );
 }
 
+// 「安全」弹窗：编辑某实例的内存安全阀（soft / hard）。
+// soft：超过且无人在远程会话时主动重启（柔和自愈，不打扰）
+// hard：超过即强制重启（无视会话，防止 OOM）
+// 留空 = 使用面板全局默认（来自 env）。
+function InstanceSecurity({ inst, onClose, onDone }: { inst: InstanceWithStatus; onClose: () => void; onDone: () => void }) {
+  const { toast, confirm } = useUI();
+  const [data, setData] = useState<import('../api').MemLimits | null>(null);
+  // 输入字段：空串 = "使用默认"（→ 提交时映射为 null）
+  const [softStr, setSoftStr] = useState('');
+  const [hardStr, setHardStr] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [regenBusy, setRegenBusy] = useState(false);
+
+  const regenMachineId = async () => {
+    const ok = await confirm({
+      title: '重置该实例的设备 ID？',
+      body: '会生成一个全新的设备标识（machine-id）并重启实例，相当于"换一台新设备"。微信需要重新扫码登录。适用于该账号被微信判定设备风险、登录即被强制退出的情况。',
+      danger: true,
+      confirmText: '重置并重启',
+    });
+    if (!ok) return;
+    setRegenBusy(true);
+    try {
+      await api.regenMachineId(inst.id);
+      toast('已重置设备 ID，实例正在重启，请稍后重新扫码登录', 'ok');
+      onClose();
+      onDone();
+    } catch (e: any) {
+      toast(e.message || '重置失败', 'error');
+    } finally {
+      setRegenBusy(false);
+    }
+  };
+
+  // 首次加载 + 每 5s 刷新 currentMB（运行实例的实时内存）
+  useEffect(() => {
+    let alive = true;
+    const fetchOnce = async (initial: boolean) => {
+      try {
+        const d = await api.getInstanceMemLimits(inst.id);
+        if (!alive) return;
+        setData(d);
+        if (initial) {
+          setSoftStr(d.soft == null ? '' : String(d.soft));
+          setHardStr(d.hard == null ? '' : String(d.hard));
+          setLoaded(true);
+        }
+      } catch (e: any) {
+        if (alive && initial) {
+          setErr(e?.message || '读取失败');
+          setLoaded(true);
+        }
+      }
+    };
+    fetchOnce(true);
+    const t = window.setInterval(() => fetchOnce(false), 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [inst.id]);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr('');
+    const parse = (s: string): number | null => {
+      const t = s.trim();
+      if (t === '') return null;
+      const n = Number(t);
+      if (!Number.isInteger(n)) throw new Error('阈值需为整数（MiB）');
+      return n;
+    };
+    let s: number | null;
+    let h: number | null;
+    try {
+      s = parse(softStr);
+      h = parse(hardStr);
+    } catch (e: any) {
+      setErr(e.message);
+      return;
+    }
+    if (s != null && h != null && s >= h) {
+      setErr('soft 阈值需小于 hard 阈值');
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.setInstanceMemLimits(inst.id, s, h);
+      onDone();
+      onClose();
+    } catch (e: any) {
+      setErr(e.message || '保存失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resetToDefault = () => {
+    setSoftStr('');
+    setHardStr('');
+  };
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <form className="card modal" onClick={(e) => e.stopPropagation()} onSubmit={submit} style={{ maxWidth: 460 }}>
+        <h2>安全 · {inst.name}</h2>
+        {!loaded ? (
+          <div className="muted small" style={{ padding: '14px 0' }}>读取中…</div>
+        ) : !data ? (
+          <div className="error">{err || '读取失败'}</div>
+        ) : (
+          <>
+            <div className="muted small" style={{ lineHeight: 1.6 }}>
+              当 KasmVNC/Xvnc 长跑泄漏内存时，面板的 watchdog 会自动重启实例。两档阈值（单位 MiB）：
+              <br />
+              <b>soft</b>：超过且<b>无人在远程会话</b>时柔和重启（不打扰使用者）。
+              <br />
+              <b>hard</b>：超过即<b>强制重启</b>，无视会话，防止 OOM 拖垮宿主。
+            </div>
+
+            <div className="security-status">
+              <div className="security-row">
+                <span>当前内存</span>
+                <b>{data.currentMB > 0 ? `${data.currentMB} MiB` : '—'}</b>
+              </div>
+              <div className="security-row">
+                <span>面板默认</span>
+                <span className="muted">soft {data.defaultSoft} · hard {data.defaultHard}</span>
+              </div>
+              <div className="security-row">
+                <span>巡检间隔</span>
+                <span className="muted">
+                  {data.watchdogEnabled ? `每 ${data.intervalSec}s` : 'watchdog 已关闭'}
+                </span>
+              </div>
+            </div>
+
+            <div className="field-label" style={{ marginTop: 12 }}>soft 阈值（留空 = 用默认 {data.defaultSoft}）</div>
+            <input
+              className="input"
+              inputMode="numeric"
+              placeholder={`${data.defaultSoft}`}
+              value={softStr}
+              onChange={(e) => setSoftStr(e.target.value.replace(/[^0-9]/g, ''))}
+            />
+            <div className="field-label" style={{ marginTop: 8 }}>hard 阈值（留空 = 用默认 {data.defaultHard}）</div>
+            <input
+              className="input"
+              inputMode="numeric"
+              placeholder={`${data.defaultHard}`}
+              value={hardStr}
+              onChange={(e) => setHardStr(e.target.value.replace(/[^0-9]/g, ''))}
+            />
+            <div className="muted small" style={{ marginTop: 6 }}>
+              提示：日常活跃内存约 1500 MiB；soft 建议略高于此（如 2000），hard 建议远低于宿主可用内存（如 3000~4000）。
+            </div>
+
+            <div className="field-label" style={{ marginTop: 16 }}>设备身份（machine-id）</div>
+            <div className="muted small" style={{ lineHeight: 1.6 }}>
+              微信会用设备标识做风控。若该账号被判定<b>设备风险</b>、登录后被强制退出且反复循环，
+              可重置为一个全新的唯一设备 ID（相当于换台新设备），再重新扫码登录。会重启该实例。
+            </div>
+            <button
+              type="button"
+              className="btn"
+              style={{ marginTop: 8, alignSelf: 'flex-start' }}
+              onClick={regenMachineId}
+              disabled={regenBusy || busy}
+            >
+              {regenBusy ? '重置中…' : '↻ 重置设备 ID 并重启'}
+            </button>
+
+            {err && <div className="error">{err}</div>}
+          </>
+        )}
+        <div className="modal-actions">
+          <button type="button" className="btn-text" onClick={resetToDefault} disabled={busy}>
+            ↺ 恢复默认
+          </button>
+          <button type="button" className="btn" onClick={onClose} disabled={busy}>
+            取消
+          </button>
+          <button className="btn btn-primary" disabled={busy || !loaded || !data}>
+            保存
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 function DeleteInstance({ inst, onClose, onDone }: { inst: InstanceWithStatus; onClose: () => void; onDone: () => void }) {
   const [purge, setPurge] = useState(false);
   const [err, setErr] = useState('');
@@ -459,6 +812,7 @@ function InstanceAdminCard({
   onRename,
   onAssign,
   onDelete,
+  onSecurity,
 }: {
   inst: InstanceWithStatus;
   userCount: number;
@@ -472,12 +826,14 @@ function InstanceAdminCard({
   onRename: () => void;
   onAssign: () => void;
   onDelete: () => void;
+  onSecurity: () => void;
 }) {
   const wx = inst.wechat;
   const busy = BUSY_PHASES.includes(wx.phase);
   const installed = wx.installed && wx.phase !== 'downloading';
   const offline = inst.runtime !== 'running';
   const working = !!acting || busy; // 生命周期操作中 或 微信下载/更新中 → 锁住卡片
+  const [menuOpen, setMenuOpen] = useState(false); // 「管理」折叠菜单是否展开
 
   let badge: { text: string; cls: string };
   if (acting) badge = { text: '处理中', cls: 'tag-busy' };
@@ -529,38 +885,62 @@ function InstanceAdminCard({
             )}
           </div>
 
-          <div className="inst-admin-links">
-            {!offline && (
-              <button className="btn-text" onClick={() => onTrigger(inst, installed ? 'update' : 'install')}>
-                {installed ? '更新微信' : '下载安装'}
-              </button>
-            )}
-            <button className="btn-text" onClick={onUpgrade} title="拉取最新镜像并重建（保留聊天记录），把实例更新到新版">
-              升级实例
-            </button>
-            {!offline && (
-              <button className="btn-text" onClick={onRestart}>
-                重启
-              </button>
-            )}
-            {!offline && (
-              <button className="btn-text" onClick={onStop}>
-                停止
-              </button>
-            )}
-            <button className="btn-text" onClick={onRename}>
-              重命名
-            </button>
-            <button className="btn-text" onClick={onAssign}>
-              分配账户
-            </button>
-            <button className="btn-text" onClick={() => window.open(api.instanceLogsUrl(inst.id), '_blank')} title="查看实例容器日志（排错）">
-              日志
-            </button>
-            <button className="btn-text danger" onClick={onDelete}>
-              删除
-            </button>
-          </div>
+          <button className={'inst-menu-toggle' + (menuOpen ? ' open' : '')} onClick={() => setMenuOpen((v) => !v)}>
+            <span>管理</span>
+            <span className="inst-menu-caret">{CaretIcon}</span>
+          </button>
+
+          {menuOpen && (
+            <div className="inst-menu">
+              <div className="inst-menu-group">
+                <div className="inst-menu-label">运维</div>
+                <div className="inst-menu-items">
+                  {!offline && (
+                    <button className="btn-text" onClick={() => onTrigger(inst, installed ? 'update' : 'install')}>
+                      {installed ? '更新微信' : '下载安装'}
+                    </button>
+                  )}
+                  <button className="btn-text" onClick={onUpgrade} title="拉取最新镜像并重建（保留聊天记录）">
+                    升级实例
+                  </button>
+                  {!offline && (
+                    <button className="btn-text" onClick={onRestart}>
+                      重启
+                    </button>
+                  )}
+                  {!offline && (
+                    <button className="btn-text" onClick={onStop}>
+                      停止
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="inst-menu-group">
+                <div className="inst-menu-label">设置</div>
+                <div className="inst-menu-items">
+                  <button className="btn-text" onClick={onRename}>
+                    重命名
+                  </button>
+                  <button className="btn-text" onClick={onAssign}>
+                    分配账户
+                  </button>
+                  <button className="btn-text" onClick={() => window.open(api.instanceLogsUrl(inst.id), '_blank')} title="查看实例容器日志">
+                    日志
+                  </button>
+                  <button className="btn-text" onClick={onSecurity} title="内存阈值自愈">
+                    安全
+                  </button>
+                </div>
+              </div>
+              <div className="inst-menu-group inst-menu-danger">
+                <div className="inst-menu-items">
+                  <button className="btn-text danger" onClick={onDelete}>
+                    删除实例
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </>
       )}
     </div>
@@ -656,13 +1036,29 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  // 未使用的旧数据卷（之前删除实例但未勾选「彻底清除」时保留下来的），允许在此复用以继承聊天记录。
+  const [orphans, setOrphans] = useState<{ name: string; createdAt?: string }[]>([]);
+  const [reuse, setReuse] = useState<string>(''); // '' = 不复用，新建空卷
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .listOrphanVolumes()
+      .then(({ volumes }) => alive && setOrphans(volumes))
+      .catch(() => {
+        /* 读取失败时不阻塞创建：列表为空即可，照常新建空卷 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr('');
     setBusy(true);
     try {
-      await api.createInstance(name.trim(), [...sel]);
+      await api.createInstance(name.trim(), [...sel], reuse || undefined);
       onDone();
     } catch (e: any) {
       setErr(e.message || '创建失败');
@@ -683,6 +1079,23 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
           onToggle={(id) => setSel((s) => toggleSet(s, id))}
           empty="暂无子账号"
         />
+        {orphans.length > 0 && (
+          <>
+            <div className="field-label" style={{ marginTop: 12 }}>数据卷（可选）</div>
+            <select className="input" value={reuse} onChange={(e) => setReuse(e.target.value)}>
+              <option value="">新建空卷（全新登录）</option>
+              {orphans.map((v) => (
+                <option key={v.name} value={v.name}>
+                  复用 · {v.name}
+                  {v.createdAt ? `（${v.createdAt.slice(0, 10)} 创建）` : ''}
+                </option>
+              ))}
+            </select>
+            <div className="muted small" style={{ marginTop: 4 }}>
+              复用旧卷需**用原微信号扫码登录**才能解密历史消息；用别的号登录将看不到旧记录。
+            </div>
+          </>
+        )}
         {err && <div className="error">{err}</div>}
         <div className="muted small" style={{ marginTop: 4 }}>创建后会拉起一个新的微信容器，进入后扫码登录。</div>
         <div className="modal-actions">
