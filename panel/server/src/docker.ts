@@ -1,6 +1,6 @@
 import { hostname } from 'node:os';
-import { existsSync, readdirSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, readdirSync } from 'node:fs';
+import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, readPanelLog, filterSince } from './logs.js';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import Docker from 'dockerode';
@@ -131,7 +131,17 @@ async function ensureImage(): Promise<void> {
   } catch {
     /* 本地没有，下面拉取 */
   }
-  await pullImage();
+  // 首次新建实例常卡在这一步（NAS 直连 docker.io 拉取超时，见 README）。这里前后都打日志：
+  // 若诊断包里只见"开始拉取"而无"完成/失败"，即可定位为拉取卡死。
+  appendPanelLog('INFO', `本地无实例镜像 ${WECHAT_IMAGE}，开始拉取（首次较慢；NAS 直连 docker.io 可能超时）…`);
+  const t0 = Date.now();
+  try {
+    await pullImage();
+    appendPanelLog('INFO', `实例镜像拉取完成 ${WECHAT_IMAGE}（耗时 ${Math.round((Date.now() - t0) / 1000)}s）`);
+  } catch (e: any) {
+    appendPanelLog('ERROR', `实例镜像拉取失败 ${WECHAT_IMAGE}（耗时 ${Math.round((Date.now() - t0) / 1000)}s）：${e?.message || e}`);
+    throw e;
+  }
 }
 
 // 创建并启动一个微信实例容器。若同名容器已存在则先移除（仅容器，不动卷）。
@@ -497,6 +507,129 @@ function tarSingleFile(name: string, content: Buffer): Buffer {
   return Buffer.concat([h, content, Buffer.alloc(pad, 0), Buffer.alloc(1024, 0)]);
 }
 
+// ---------- 诊断包 ----------
+// 单个 tar entry（USTAR header + 内容 + 512 对齐填充），复用与 tarSingleFile 相同的格式。
+function tarEntry(name: string, content: Buffer): Buffer {
+  const h = Buffer.alloc(512, 0);
+  h.write(name.slice(0, 100), 0, 'utf8');
+  h.write('0000644\0', 100);
+  h.write('0001750\0', 108);
+  h.write('0001750\0', 116);
+  h.write(content.length.toString(8).padStart(11, '0') + '\0', 124);
+  h.write('00000000000\0', 136);
+  h.write('        ', 148); // checksum 占位
+  h.write('0', 156); // typeflag 普通文件
+  h.write('ustar\0', 257);
+  h.write('00', 263);
+  let sum = 0;
+  for (let i = 0; i < 512; i++) sum += h[i];
+  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
+  const pad = (512 - (content.length % 512)) % 512;
+  return Buffer.concat([h, content, Buffer.alloc(pad, 0)]);
+}
+
+// 多文件 tar.gz（内存构建；诊断包通常仅数 MB）。文件名用 ASCII 路径避免 utf8 超 100 字节。
+function buildTarGz(entries: { name: string; content: string | Buffer }[]): Buffer {
+  const parts = entries.map((e) => tarEntry(e.name, Buffer.isBuffer(e.content) ? e.content : Buffer.from(e.content, 'utf8')));
+  parts.push(Buffer.alloc(1024, 0)); // 两个空块标记归档结束
+  return zlib.gzipSync(Buffer.concat(parts));
+}
+
+// 汇总诊断包：系统信息 + 面板全局日志 + 每个实例（容器状态 + 持久日志 + 实时日志）+ 全部 woc-* 容器清单。
+// 日志按 sinceMs 时间裁剪。给排查"首个实例创建卡死 / 打开实例黑屏不可用 / 升级失败"等问题用。
+export async function buildDiagnostics(instances: Instance[], sinceMs: number, meta: Record<string, string>): Promise<Buffer> {
+  const entries: { name: string; content: string | Buffer }[] = [];
+  const stamp = new Date().toISOString();
+
+  entries.push({
+    name: 'README.txt',
+    content: [
+      '云微 · WechatOnCloud 诊断包',
+      `生成时间: ${stamp}`,
+      `时间范围: 最近 ${meta.range || '24h'}`,
+      '',
+      '内容：',
+      '  system.txt        系统/Docker/镜像信息',
+      '  panel.log         面板全局运维日志（创建/删除/升级/启停/镜像拉取/错误）',
+      '  containers.txt    所有 woc-* 容器清单（含残留/未登记）',
+      '  instances/<id>.log 每个实例：容器状态 + 持久日志 + 实时容器日志',
+      '',
+      '把本压缩包发给维护者即可协助排查（不含密码/密钥等敏感信息）。',
+    ].join('\n'),
+  });
+
+  // 系统信息
+  let sys = `生成时间: ${stamp}\n时间范围: 最近 ${meta.range || '24h'}\n\n`;
+  for (const [k, v] of Object.entries(meta)) sys += `${k}: ${v}\n`;
+  try {
+    const ver: any = await docker.version();
+    sys += `\nDocker 版本: ${ver.Version} (API ${ver.ApiVersion}, ${ver.Os}/${ver.Arch})\n`;
+  } catch (e: any) {
+    sys += `\nDocker 版本: 获取失败 ${e?.message || e}\n`;
+  }
+  try {
+    const info: any = await docker.info();
+    sys += `容器: ${info.Containers}（运行 ${info.ContainersRunning}） · 镜像: ${info.Images}\n`;
+    sys += `内核: ${info.KernelVersion} · OS: ${info.OperatingSystem} · 架构: ${info.Architecture}\n`;
+    sys += `CPU: ${info.NCPU} 核 · 内存: ${(info.MemTotal / 1073741824).toFixed(1)} GiB\n`;
+    if (Array.isArray(info.Warnings) && info.Warnings.length) sys += `Docker 警告: ${info.Warnings.join('; ')}\n`;
+  } catch (e: any) {
+    sys += `Docker info: 获取失败 ${e?.message || e}\n`;
+  }
+  try {
+    const img: any = await docker.getImage(WECHAT_IMAGE).inspect();
+    sys += `\n实例镜像 ${WECHAT_IMAGE}: ${String(img.Id).slice(0, 19)} · 创建 ${img.Created}\n`;
+  } catch {
+    sys += `\n实例镜像 ${WECHAT_IMAGE}: 本地不存在（首次新建实例需联网拉取，可能在此卡住）\n`;
+  }
+  sys += `\n实例数: ${instances.length}\n`;
+  entries.push({ name: 'system.txt', content: sys });
+
+  // 面板全局日志（按范围裁剪）
+  entries.push({ name: 'panel.log', content: filterSince(readPanelLog(), sinceMs) || '（无面板日志）' });
+
+  // 每个实例
+  for (const inst of instances) {
+    let c = `实例: ${inst.name}\nID: ${inst.id}\n容器: ${inst.containerName}\n类型: ${instanceAppType(inst)}\n数据卷: ${inst.volumeName}\n创建: ${inst.createdAt}\n\n`;
+    try {
+      const info: any = await docker.getContainer(inst.containerName).inspect();
+      const s = info.State || {};
+      c += `===== 容器状态 =====\n运行: ${s.Running} · 状态: ${s.Status} · 退出码: ${s.ExitCode}\n`;
+      c += `OOMKilled: ${s.OOMKilled} · 重启次数: ${info.RestartCount} · 启动于: ${s.StartedAt}\n`;
+      if (s.Error) c += `错误: ${s.Error}\n`;
+      c += `镜像: ${String(info.Image).slice(0, 19)} · 健康: ${s.Health?.Status ?? 'n/a'}\n\n`;
+    } catch (e: any) {
+      c += `===== 容器状态 =====\n无法读取（容器可能未创建/已删除）：${e?.message || e}\n\n`;
+    }
+    c += `===== 持久化日志（最近 ${meta.range || '24h'}） =====\n${filterSince(readInstanceLog(inst.id), sinceMs) || '（无）'}\n\n`;
+    try {
+      c += `===== 本次容器日志（实时 tail 300） =====\n${(await instanceLogs(inst, 300)).trimEnd() || '（无）'}\n`;
+    } catch (e: any) {
+      c += `===== 本次容器日志 =====\n获取失败：${e?.message || e}\n`;
+    }
+    entries.push({ name: `instances/${inst.id}.log`, content: c });
+  }
+
+  // 全部 woc-* 容器清单（含未登记/残留，用于诊断"首次创建失败遗留"）
+  try {
+    const all = await docker.listContainers({ all: true });
+    const known = new Set(instances.map((i) => i.containerName));
+    let txt = '所有 woc-* 容器：\n\n';
+    for (const ct of all) {
+      const names = (ct.Names || []).map((n: string) => n.replace(/^\//, ''));
+      if (!names.some((n) => n.startsWith('woc-'))) continue;
+      const nm = names.join(',');
+      const tag = nm.includes('woc-panel') ? '面板' : known.has(nm) ? '已登记实例' : '未登记/残留';
+      txt += `[${tag}] ${nm} · ${ct.State}/${ct.Status} · ${ct.Image}\n`;
+    }
+    entries.push({ name: 'containers.txt', content: txt });
+  } catch (e: any) {
+    entries.push({ name: 'containers.txt', content: '获取失败：' + (e?.message || e) });
+  }
+
+  return buildTarGz(entries);
+}
+
 // 校验文件名为安全 basename（防路径穿越）。
 function safeName(name: string): boolean {
   return !!name && name.length <= 200 && !name.includes('/') && !name.includes('\0') && name !== '.' && name !== '..';
@@ -586,49 +719,9 @@ export async function instanceLogs(inst: Instance, tail = 600): Promise<string> 
   return out || buf.toString('utf8'); // 兜底：TTY 模式非多路复用
 }
 
-// ---------- 持久化日志（跨容器重建保留，存在面板数据卷里） ----------
-// docker logs 随容器重建（重启/升级/看门狗自愈）即丢失，看不到"上次为何重启/崩溃"。这里把
-// 重启原因 + 重建前的容器日志快照 + 生命周期事件，追加到面板数据卷的 /…/logs/<id>.log，跨重建保留。
-// 与 store.ts 的 accounts.json 同目录（面板数据卷，宿主 ./data-panel 持久化）。fallback 须与 store.ts 一致。
-const LOG_DIR = `${dirname(process.env.PANEL_DATA || '/data/panel/accounts.json')}/logs`;
-const LOG_CAP = 400 * 1024; // 每实例日志上限 ~400KB，超限截掉前半保留最近
-
-function logPath(id: string): string {
-  return `${LOG_DIR}/${id}.log`;
-}
-
-export function appendInstanceLog(id: string, line: string): void {
-  if (!/^[0-9a-f]{1,32}$/.test(id)) return; // 防路径注入；实例 id 为十六进制
-  try {
-    mkdirSync(LOG_DIR, { recursive: true });
-    const p = logPath(id);
-    appendFileSync(p, `[${new Date().toISOString()}] ${line}\n`);
-    const sz = statSync(p).size;
-    if (sz > LOG_CAP) writeFileSync(p, readFileSync(p).subarray(sz - Math.floor(LOG_CAP / 2)));
-  } catch {
-    /* 写持久日志失败不影响主流程 */
-  }
-}
-
-export function readInstanceLog(id: string): string {
-  if (!/^[0-9a-f]{1,32}$/.test(id)) return '';
-  try {
-    const p = logPath(id);
-    return existsSync(p) ? readFileSync(p, 'utf8') : '';
-  } catch {
-    return '';
-  }
-}
-
-// 实例彻底删除（连数据卷一并清除）时，顺手删掉它的持久日志文件，避免遗留孤儿。
-export function deleteInstanceLog(id: string): void {
-  if (!/^[0-9a-f]{1,32}$/.test(id)) return;
-  try {
-    rmSync(logPath(id), { force: true });
-  } catch {
-    /* 忽略 */
-  }
-}
+// ---------- 持久化日志 ----------
+// 日志原语（appendInstanceLog / readInstanceLog / deleteInstanceLog / appendPanelLog 等）已抽到 logs.ts
+// （无 docker 依赖，避免循环）。这里只保留需要 docker 的快照能力。
 
 // 把"即将被删/重建"的容器最后日志快照进持久日志（否则随容器删除丢失）。
 export async function snapshotContainerLog(inst: Instance, reason: string): Promise<void> {

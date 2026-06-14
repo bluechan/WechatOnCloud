@@ -1047,6 +1047,14 @@ button {
   gap: 6px;
   margin-top: 4px;
 }
+/* 诊断包时间范围选择行 */
+.diag-range {
+  margin-top: 12px;
+}
+.diag-range .field-label {
+  display: block;
+  margin: 0 2px 8px;
+}
 .chip-row-pick {
   display: flex;
 }

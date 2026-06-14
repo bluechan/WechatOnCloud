@@ -82,6 +82,61 @@ function EmptyState({ icon, title, sub, action }: { icon: string; title: string;
 
 const RELEASES_URL = 'https://github.com/Gloridust/WechatOnCloud/releases';
 
+const DIAG_RANGE_OPTIONS = [
+  { key: '24h', label: '24 小时' },
+  { key: '7d', label: '7 天' },
+  { key: '30d', label: '30 天' },
+  { key: '1y', label: '1 年' },
+];
+
+// 「诊断与日志」（仅管理员）：单实例「日志」只记录该实例日志；这里一键打包全局——系统信息 +
+// 面板运维日志 + 全部实例容器状态/日志 + 容器清单，便于排查部署/创建卡死/黑屏不可用等问题。
+function DiagnosticsSection() {
+  const [range, setRange] = useState('24h');
+  const exportBundle = () => {
+    // tar.gz 带 content-disposition: attachment，用隐藏 <a> 触发下载（带同源 cookie），不离开页面。
+    const a = document.createElement('a');
+    a.href = api.diagnosticsUrl(range);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+  return (
+    <>
+      <div className="section-row" style={{ marginTop: 22 }}>
+        <span className="section-title">诊断与日志</span>
+      </div>
+      <div className="inst-grid">
+        <div className="inst-card">
+          <div className="inst-head">
+            <span className="inst-name">导出诊断包</span>
+          </div>
+          <div className="inst-sub">打包系统/Docker 信息 + 面板全局日志 + 各实例容器状态与日志 + 容器清单，用于排查部署、创建卡死、黑屏不可用、升级失败等问题。</div>
+          <div className="diag-range">
+            <span className="field-label">时间范围</span>
+            <div className="chip-row">
+              {DIAG_RANGE_OPTIONS.map((r) => (
+                <button key={r.key} className={'chip-toggle' + (range === r.key ? ' on' : '')} onClick={() => setRange(r.key)}>
+                  {r.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="inst-actions">
+            <button className="btn btn-primary" onClick={exportBundle}>
+              导出诊断包 (.tar.gz)
+            </button>
+            <a className="btn" href={api.panelLogUrl(range)} target="_blank" rel="noreferrer">
+              查看面板日志
+            </a>
+          </div>
+          <div className="muted small ver-checked">导出当前选定时间范围内的日志。超过一年的日志会自动清理；诊断包不含密码/密钥等敏感信息。</div>
+        </div>
+      </div>
+    </>
+  );
+}
+
 // 「关于」：显示真实构建版本号 + 检测新版（后台已每 6h 查 Docker Hub/GHCR；这里读缓存并可手动重查）。
 function AboutSection({ isAdmin }: { isAdmin: boolean }) {
   const { toast } = useUI();
@@ -538,6 +593,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
           </div>
         </div>
 
+        {isAdmin && <DiagnosticsSection />}
         <AboutSection isAdmin={isAdmin} />
       </main>
 

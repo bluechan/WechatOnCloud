@@ -184,6 +184,9 @@ export const api = {
   instanceRestart: (id: string) => req(`/api/admin/instances/${id}/restart`, { method: 'POST' }),
   instanceUpgrade: (id: string) => req(`/api/admin/instances/${id}/upgrade`, { method: 'POST' }),
   instanceLogsUrl: (id: string) => `/api/admin/instances/${id}/logs`,
+  // 全局日志 / 诊断包（范围 24h/7d/30d/1y）
+  diagnosticsUrl: (range: string) => `/api/admin/diagnostics?range=${encodeURIComponent(range)}`,
+  panelLogUrl: (range: string) => `/api/admin/panel-log?range=${encodeURIComponent(range)}`,
 
   // 文件中转
   listFiles: (id: string) => req<{ files: { name: string; size: number }[] }>(`/api/instances/${id}/files`),

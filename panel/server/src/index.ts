@@ -50,8 +50,7 @@ import {
   downloadFromInstance,
   deleteInstanceFile,
   instanceLogs,
-  appendInstanceLog,
-  readInstanceLog,
+  buildDiagnostics,
   typeInInstance,
   keyInInstance,
   listOrphanVolumes,
@@ -74,6 +73,7 @@ import {
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
+import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -307,12 +307,19 @@ app.post('/api/admin/instances', async (req, reply) => {
     reuseVolumeName = reuseVolume;
   }
   const inst = createInstance(String(name), admin.id, allowedUserIds, reuseVolumeName, type);
+  appendPanelLog(
+    'INFO',
+    `创建实例「${inst.name}」(${type}, id=${inst.id}) by ${admin.username}${reuseVolumeName ? ` · 复用卷 ${reuseVolumeName}` : ''} → 开始创建容器（镜像缺失会自动拉取，首次较慢）`,
+  );
+  appendInstanceLog(inst.id, `实例创建（${type}）by ${admin.username}`);
   try {
     await runInstance(inst);
   } catch (e: any) {
     removeInstanceRecord(inst.id); // 容器起不来则回滚登记
+    appendPanelLog('ERROR', `创建实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '创建容器失败：' + (e?.message || e) });
   }
+  appendPanelLog('INFO', `创建实例「${inst.name}」(id=${inst.id}) 成功`);
   return { instance: publicInstance(inst) };
 });
 
@@ -449,6 +456,7 @@ app.delete('/api/admin/instances/:id', async (req, reply) => {
   const purge = (req.query as any)?.purge === '1' || (req.query as any)?.purge === 'true';
   const inst = findInstance(id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  appendPanelLog('INFO', `删除实例「${inst.name}」(id=${id})${purge ? ' · 同时清除数据卷' : ' · 保留数据卷'}`);
   await removeInstanceContainer(inst, purge);
   removeInstanceRecord(id);
   controlHolders.delete(id);
@@ -484,8 +492,10 @@ app.post('/api/admin/instances/:id/start', async (req, reply) => {
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
     await ensureRunning(inst);
+    appendPanelLog('INFO', `启动实例「${inst.name}」(id=${inst.id})`);
     return { ok: true };
   } catch (e: any) {
+    appendPanelLog('ERROR', `启动实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '启动失败：' + (e?.message || e) });
   }
 });
@@ -497,8 +507,10 @@ app.post('/api/admin/instances/:id/stop', async (req, reply) => {
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
     await stopInstance(inst);
+    appendPanelLog('INFO', `停止实例「${inst.name}」(id=${inst.id})`);
     return { ok: true };
   } catch (e: any) {
+    appendPanelLog('ERROR', `停止实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '停止失败：' + (e?.message || e) });
   }
 });
@@ -509,9 +521,11 @@ app.post('/api/admin/instances/:id/restart', async (req, reply) => {
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
+    appendPanelLog('INFO', `重启实例「${inst.name}」(id=${inst.id})`);
     await runInstance(inst);
     return { ok: true };
   } catch (e: any) {
+    appendPanelLog('ERROR', `重启实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '重启失败：' + (e?.message || e) });
   }
 });
@@ -523,9 +537,12 @@ app.post('/api/admin/instances/:id/upgrade', async (req, reply) => {
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
+    appendPanelLog('INFO', `升级实例「${inst.name}」(id=${inst.id})：拉取最新镜像后重建`);
     await upgradeInstance(inst);
+    appendPanelLog('INFO', `升级实例「${inst.name}」(id=${inst.id}) 完成`);
     return { ok: true };
   } catch (e: any) {
+    appendPanelLog('ERROR', `升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '升级失败：' + (e?.message || e) });
   }
 });
@@ -701,6 +718,37 @@ app.get('/api/admin/instances/:id/logs', async (req, reply) => {
   );
 });
 
+// ---------- 全局日志 / 诊断包（仅管理员）----------
+// 面板全局运维日志（创建/删除/升级/启停/镜像拉取/错误等跨实例事件），可按时间范围裁剪。
+app.get('/api/admin/panel-log', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  reply.header('content-type', 'text/plain; charset=utf-8');
+  const since = Date.now() - rangeToMs((req.query as any)?.range);
+  const text = filterSince(readPanelLog(), since).trimEnd();
+  return reply.send(text || '（暂无面板日志）');
+});
+
+// 一键导出诊断包（tar.gz）：系统信息 + 面板日志 + 各实例容器状态/持久日志/实时日志 + 全部容器清单。
+// 单实例日志只记录"实例内单次日志"，这里把全局 + 全部实例 + 容器层面的信息打包，便于排查
+// 首个实例创建卡死 / 打开实例黑屏不可用 / 升级失败等问题。range：24h（默认）/7d/30d/1y。
+app.get('/api/admin/diagnostics', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const range = ((req.query as any)?.range as string) || '24h';
+  if (!DIAG_RANGES[range]) return reply.code(400).send({ error: '时间范围非法（24h/7d/30d/1y）' });
+  const since = Date.now() - rangeToMs(range);
+  try {
+    const buf = await buildDiagnostics(listInstances(), since, { range, 面板版本: CURRENT_VERSION });
+    const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+    reply.header('content-type', 'application/gzip');
+    reply.header('content-disposition', `attachment; filename="woc-diag-${range}-${stamp}.tar.gz"`);
+    appendPanelLog('INFO', `导出诊断包（范围 ${range}，${buf.length} 字节）`);
+    return reply.send(buf);
+  } catch (e: any) {
+    appendPanelLog('ERROR', `导出诊断包失败：${e?.message || e}`);
+    return reply.code(500).send({ error: '生成诊断包失败：' + (e?.message || e) });
+  }
+});
+
 // ---------- 数据卷管理（仅管理员）：浏览/上传/解压/下载/改名/移动/删除 + 整卷备份/恢复 ----------
 // 数据卷 = 容器 /config，含微信完整会话与加密聊天库 → 仅 admin 可见可用（admin 本就有 docker.sock=宿主 root，
 // 不新增风险；子账号永不可达）。
@@ -854,8 +902,10 @@ async function triggerInstanceWechat(id: string, cmd: 'install' | 'update', repl
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
     await triggerWechat(inst, cmd);
+    appendPanelLog('INFO', `实例「${inst.name}」(id=${id}) 触发${cmd === 'install' ? '下载安装' : '更新'}应用`);
     return { ok: true };
   } catch (e: any) {
+    appendPanelLog('ERROR', `实例「${inst.name}」(id=${id}) 触发${cmd === 'install' ? '安装' : '更新'}失败：${e?.message || e}`);
     return reply.code(500).send({ error: '无法触发安装：' + (e?.message || e) });
   }
 }
@@ -1034,12 +1084,14 @@ if (WATCHDOG_ENABLED) {
     recovering.add(inst.id);
     app.log.warn(`[watchdog] ${inst.containerName} ${detail}`);
     appendInstanceLog(inst.id, `[看门狗] 自愈重启（${reason}）：${detail}`);
+    appendPanelLog('WARN', `[看门狗] 实例「${inst.name}」(id=${inst.id}) 自愈重启（${reason}）：${detail}`);
     try {
       await stopInstance(inst);
       await runInstance(inst);
       healthFails.delete(inst.id);
       app.log.info(`[watchdog] ${inst.containerName} 自愈完成（${reason}）`);
     } catch (e: any) {
+      appendPanelLog('ERROR', `[看门狗] 实例「${inst.name}」(id=${inst.id}) 自愈失败（${reason}）：${e?.message || e}`);
       app.log.error(`[watchdog] ${inst.containerName} 自愈失败（${reason}）: ${e?.message || e}`);
     } finally {
       recovering.delete(inst.id);
@@ -1098,4 +1150,8 @@ if (WATCHDOG_ENABLED) {
 
 await app.listen({ port: PORT, host: HOST });
 console.log(`[panel] 监听 http://${HOST}:${PORT}  （多实例反代已就绪）· 版本 ${CURRENT_VERSION}`);
+appendPanelLog('INFO', `面板启动 · 版本 ${CURRENT_VERSION} · 监听 ${HOST}:${PORT}`);
 startUpdateChecker(); // 后台检测新版（best-effort，失败静默）
+// 日志保留期清理：启动后跑一次 + 每 24h 一次，删除超过一年的日志行（unref 不阻止退出）。
+pruneOldLogs();
+setInterval(() => pruneOldLogs(), 24 * 60 * 60 * 1000).unref();
