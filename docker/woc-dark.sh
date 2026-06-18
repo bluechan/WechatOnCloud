@@ -5,9 +5,16 @@
 # 须与 autostart 用完全相同的 XDG_RUNTIME_DIR / 总线地址，否则改的不是同一个 dconf、portal 读不到。
 set -u
 
-uid="$(id -u)"
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/woc-run-${uid}}"
-export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/woc-bus}"
+# 必须用与 autostart 完全相同的总线，否则改了 dconf 也通知不到那条总线上的 portal（微信/浏览器就不会实时变）。
+# autostart 已把真实 XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS 落到 /config/.woc-dark-env（docker exec 不继承
+# 会话环境，不能自行猜测——base 镜像里 XDG_RUNTIME_DIR 是 /config/.XDG 而非 /tmp/woc-run-<uid>）。
+if [ -f /config/.woc-dark-env ]; then
+    # shellcheck source=/dev/null
+    . /config/.woc-dark-env
+fi
+: "${XDG_RUNTIME_DIR:=/config/.XDG}"
+: "${DBUS_SESSION_BUS_ADDRESS:=unix:path=${XDG_RUNTIME_DIR}/woc-bus}"
+export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
 
 case "${1:-}" in
     on | 1 | dark | true)
